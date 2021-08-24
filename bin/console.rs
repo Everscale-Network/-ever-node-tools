@@ -9,7 +9,7 @@ use ton_api::ton::{
     engine::validator::ControlQueryError,
     rpc::engine::validator::ControlQuery,
 };
-use ton_block::{AccountStatus, Deserializable, BlockIdExt, Serializable};
+use ton_block::{Account, AccountStatus, Deserializable, BlockIdExt, Serializable};
 use ton_types::{error, fail, Result, BuilderData, serialize_toc};
 use std::{
     convert::TryInto,
@@ -84,8 +84,8 @@ commands! {
     GetStats, "getstats", "getstats\tget status validator"
     GetSessionStats, "getconsensusstats", "getconsensusstats\tget consensus statistics for the node"
     SendMessage, "sendmessage", "sendmessage <filename>\tload a serialized message from <filename> and send it to server"
-    GetAccountState, "getaccountstate", "getaccountstate <account id> <workchain> <file name>\tsave accountstate to file"
-    GetAccount, "getaccount", "getaccount <account id> <workchain> <Option<file name>>\tget account info"
+    GetAccountState, "getaccountstate", "getaccountstate <account id> <file name>\tsave accountstate to file"
+    GetAccount, "getaccount", "getaccount <account id> <Option<file name>>\tget account info"
     GetConfig, "getconfig", "getconfig <param_number>\tget current config param from masterchain state"
     SetStatesGcInterval, "setstatesgcinterval", "setstatesgcinterval <milliseconds>\tset interval in <milliseconds> between shard states GC runs"
 }
@@ -348,7 +348,10 @@ impl SendReceive for GetAccount {
         let account = AccountAddress { 
             account_address: params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string()
         };
-        let workchain = parse_int(params.next(), "workchain")?;
+
+        let workchain_str = &account.account_address[0..account.account_address.find(":").unwrap_or(0)];
+
+        let workchain = parse_int(Some(workchain_str.clone()), "workchain")?;
         Ok(TLObject::new(ton::rpc::raw::GetAccount {account_address: account, workchain: workchain }))
     }
 
@@ -361,8 +364,6 @@ impl SendReceive for GetAccount {
         let raw_account_state = deserialize(raw_account_state.bytes().unsecure()).unwrap();
         let account_state = raw_account_state.downcast::<ton_api::ton::raw::FullAccountState>()?;
 
-        params.next();
-
         let account_type = match AccountStatus::construct_from_bytes(&account_state.frozen_hash()).unwrap() {
             AccountStatus::AccStateUninit => "Uninit",
             AccountStatus::AccStateFrozen => "Frozen",
@@ -370,19 +371,34 @@ impl SendReceive for GetAccount {
             AccountStatus::AccStateNonexist => "Nonexist"
         };
 
+        let account = Account::construct_from_bytes(&account_state.data()).unwrap();
+        let balance = account.balance().map_or(0, |val| val.grams.0);
+
         let mut account_info = String::from("{");
-
-        account_info.push_str("acc_type:\t");
+        account_info.push_str("\n\"");
+        account_info.push_str("acc_type\":\t");
         account_info.push_str(&account_type);
-        //account_info.push_str("\n");
-
+        account_info.push_str("\n\"");
+        account_info.push_str("balance\":\t");
+        account_info.push_str(&balance.to_string());
+        account_info.push_str("\n\"");
+        account_info.push_str("last_paid\":\t");
+        account_info.push_str(&account.last_paid().to_string());
+        account_info.push_str("\n\"");
+        account_info.push_str("last_trans_lt\":\t");
+        account_info.push_str(&format!("{:#x}", account_state.last_transaction_id().lt));
+        account_info.push_str("\n\"");
+        account_info.push_str("data(boc)\":\t");
+        account_info.push_str(&hex::encode(&account_state.data().0));
         account_info.push_str("\n}");
 
-        let boc_name = params.next().unwrap().to_string();
-        //std::fs::write(boc_name, account_state.data().0.clone())
-        //    .map_err(|err| error!("Can`t create file: {}", err)).unwrap();
+        let account_data = account_info.as_bytes().to_vec();
+        if let Some(boc_name) = params.next() {
+            std::fs::write(boc_name.to_string(), &account_data)
+                .map_err(|err| error!("Can`t create file: {}", err)).unwrap();
+        }
 
-        Ok((account_info.clone(), account_info.as_bytes().to_vec()))
+        Ok((account_info.clone(), account_data))
     }
 }
 
@@ -391,7 +407,9 @@ impl SendReceive for GetAccountState {
         let account = AccountAddress { 
             account_address: params.next().ok_or_else(|| error!("insufficient parameters"))?.to_string()
         };
-        let workchain = parse_int(params.next(), "workchain")?;
+        let workchain_str = &account.account_address[0..account.account_address.find(":").unwrap_or(0)];
+        let workchain = parse_int(Some(workchain_str.clone()), "workchain")?;
+
         let get_account = ton::rpc::raw::GetAccount { account_address: account, workchain: workchain }; 
         Ok(TLObject::new(get_account))
     }
@@ -405,18 +423,6 @@ impl SendReceive for GetAccountState {
         let raw_account_state = deserialize(raw_account_state.bytes().unsecure()).unwrap();
         let account_state = raw_account_state.downcast::<ton_api::ton::raw::FullAccountState>()?;
 
-        /*let code_cell = deserialize_tree_of_cells(&mut Cursor::new(&account_state.code().0)).unwrap();
-        let data_cell = deserialize_tree_of_cells(&mut Cursor::new(&account_state.data().0)).unwrap();
-
-        let state_init = StateInit {
-            split_depth: None,
-            special: None,
-            code: Some(code_cell),
-            data: Some(data_cell),
-            library: StateInitLib::default()
-        };
-        let state_init_raw = state_init.write_to_bytes().unwrap();
-        */
         params.next();
         let boc_name = params.next().unwrap().to_string();
         std::fs::write(boc_name, account_state.data().0.clone())
@@ -646,14 +652,6 @@ struct AdnlConsoleConfigJson {
 
 #[tokio::main]
 async fn main() {
-    println!(
-        "tonlabs console {}\nCOMMIT_ID: {}\nBUILD_DATE: {}\nCOMMIT_DATE: {}\nGIT_BRANCH: {}",
-        env!("CARGO_PKG_VERSION"),
-        env!("BUILD_GIT_COMMIT"),
-        env!("BUILD_TIME") ,
-        env!("BUILD_GIT_DATE"),
-        env!("BUILD_GIT_BRANCH")
-    );
     // init_test_log();
     let args = App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
@@ -678,7 +676,24 @@ async fn main() {
             .help("timeout in batch mode")
             .takes_value(true)
             .number_of_values(1))
+        .arg(Arg::with_name("JSON")
+            .short("j")
+            .long("json")
+            .help("output in json format")
+            .takes_value(true)
+            .number_of_values(1))
         .get_matches();
+
+    if args.value_of("JSON").is_none() {
+        println!(
+            "tonlabs console {}\nCOMMIT_ID: {}\nBUILD_DATE: {}\nCOMMIT_DATE: {}\nGIT_BRANCH: {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_GIT_COMMIT"),
+            env!("BUILD_TIME") ,
+            env!("BUILD_GIT_DATE"),
+            env!("BUILD_GIT_BRANCH")
+        );
+    }
 
     let config = args.value_of("CONFIG").expect("required set for config");
     let config = std::fs::read_to_string(config).expect("Can't read config file");
